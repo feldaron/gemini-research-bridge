@@ -6,7 +6,7 @@ info:
     Controller-only API for submitting research tasks and reviewing proposed
     resolutions. Research workers never write to the controller's source database.
 servers:
-  - url: /
+  - url: https://gemini-research-bridge.laptopvalue.co.uk
 security:
   - bearerAuth: []
 paths:
