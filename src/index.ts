@@ -5,7 +5,6 @@ interface Env {
 }
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-
 type JobStatus = "queued" | "claimed" | "completed" | "failed";
 type ReviewStatus = "pending" | "accepted" | "rejected";
 
@@ -44,9 +43,11 @@ type ProposalRow = {
 };
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
+const RESEARCH_KIND = "research";
+const RESEARCH_INPUT_FORMAT = "gemini-research-bridge.research-input.v1";
 const OFFLINE_JOBS_FORMAT = "gemini-research-bridge.offline-jobs.v1";
 const OFFLINE_PROPOSALS_FORMAT = "gemini-research-bridge.offline-proposals.v1";
-const JOB_IMPORT_FORMAT = "gemini-research-bridge.jobs.v1";
+const ADVANCED_JOB_FORMAT = "gemini-research-bridge.jobs.v1";
 
 function json(data: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data, null, 2), {
@@ -85,13 +86,6 @@ function publicJob(row: JobRow) {
   };
 }
 
-function workerJob(row: JobRow) {
-  return {
-    ...publicJob(row),
-    claim_token: row.claim_token,
-  };
-}
-
 function publicProposal(row: ProposalRow) {
   return {
     id: row.id,
@@ -118,8 +112,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 function bearer(request: Request): string | null {
   const header = request.headers.get("authorization") ?? "";
-  if (!header.startsWith("Bearer ")) return null;
-  return header.slice(7);
+  return header.startsWith("Bearer ") ? header.slice(7) : null;
 }
 
 function authorized(request: Request, expected: string | undefined): boolean {
@@ -135,15 +128,123 @@ async function body<T>(request: Request): Promise<T> {
   }
 }
 
+function cleanText(value: unknown, max: number): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, max) : null;
+}
+
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
   return Math.max(min, Math.min(max, Math.trunc(value)));
 }
 
-function cleanText(value: unknown, max: number): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed ? trimmed.slice(0, max) : null;
+function researchResponseFormat() {
+  return {
+    output_mode: "json_only",
+    instruction:
+      "Return exactly one valid JSON object. No Markdown fences, no prose before or after it, no comments, and no trailing commas.",
+    required_result_fields: [
+      "resolution",
+      "proposed_value",
+      "evidence",
+      "reasoning",
+      "confidence",
+      "conflicts",
+    ],
+    result_schema: {
+      resolution: {
+        type: "string",
+        allowed: ["proposed", "unresolved"],
+        meaning: "Use proposed only when the evidence actually supports a defensible resolution; otherwise use unresolved.",
+      },
+      proposed_value: {
+        type: "any_or_null",
+        meaning: "The proposed answer/value. Must be null when resolution is unresolved.",
+      },
+      evidence: {
+        type: "array",
+        item_fields: {
+          url: "Direct source URL.",
+          source_title: "Title or identifying name of the source.",
+          source_type: "manufacturer | professional_review | retailer | documentation | database | other",
+          evidence_text: "Short exact evidence or faithful concise extract that supports the proposal.",
+          applies_to: "Exact product/configuration/entity the evidence describes.",
+          applicability: "Why this evidence applies to the research task; state any limitation explicitly.",
+        },
+      },
+      reasoning: {
+        type: "string",
+        meaning: "Concise reasoning linking the evidence to the proposed result. Do not hide uncertainty.",
+      },
+      confidence: { type: "string", allowed: ["high", "medium", "low"] },
+      conflicts: {
+        type: "array",
+        meaning: "Contradictory evidence, unresolved identity issues, or other reasons the controller should scrutinize the proposal.",
+      },
+      research_notes: { type: "string", optional: true },
+    },
+  };
+}
+
+function researchRules() {
+  return [
+    "Research the task independently using reliable evidence.",
+    "Prefer primary/manufacturer/documentation sources where appropriate, then strong professional sources.",
+    "Do not guess, fill gaps from plausibility, or convert absence of evidence into a negative fact.",
+    "Respect exact identity and scope in the supplied context; do not silently transfer evidence between different products/configurations/entities.",
+    "If identity, applicability, or evidence is insufficient or conflicting, return resolution=unresolved.",
+    "Every proposed resolution must include enough provenance for a separate controller to verify it.",
+    "You are a research worker only. Your output is a proposal and must not claim that any database has been updated.",
+  ];
+}
+
+function normalizeResearchPayload(input: {
+  task?: string;
+  context?: JsonValue;
+  instructions?: string | string[];
+}): JsonValue {
+  const task = cleanText(input.task, 12000);
+  if (!task) throw new Error("task_required");
+
+  let extraInstructions: string[] = [];
+  if (typeof input.instructions === "string") {
+    const item = cleanText(input.instructions, 8000);
+    if (item) extraInstructions = [item];
+  } else if (Array.isArray(input.instructions)) {
+    extraInstructions = input.instructions
+      .map((item) => cleanText(item, 4000))
+      .filter((item): item is string => Boolean(item))
+      .slice(0, 20);
+  }
+
+  return {
+    protocol: "research-task.v1",
+    task,
+    context: input.context ?? null,
+    extra_instructions: extraInstructions,
+  };
+}
+
+function researchPrompt(payload: JsonValue): string {
+  const value = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as { [key: string]: JsonValue }
+    : { task: payload };
+  const task = typeof value.task === "string" ? value.task : "";
+  const context = "context" in value ? value.context : null;
+  const extra = Array.isArray(value.extra_instructions) ? value.extra_instructions : [];
+  const contract = {
+    role: "research_worker",
+    task,
+    context,
+    rules: [...researchRules(), ...extra],
+    response_format: researchResponseFormat(),
+  };
+  return [
+    "Complete the research task in the JSON contract below.",
+    "Follow the rules and return only the requested JSON result object.",
+    JSON.stringify(contract, null, 2),
+  ].join("\n\n");
 }
 
 async function addEvent(
@@ -156,7 +257,13 @@ async function addEvent(
   await env.DB.prepare(`
     INSERT INTO job_events (id, job_id, event_type, actor, payload)
     VALUES (?, ?, ?, ?, ?)
-  `).bind(crypto.randomUUID(), jobId, eventType, actor, payload === null ? null : JSON.stringify(payload)).run();
+  `).bind(
+    crypto.randomUUID(),
+    jobId,
+    eventType,
+    actor,
+    payload === null ? null : JSON.stringify(payload),
+  ).run();
 }
 
 async function insertJob(env: Env, input: {
@@ -206,7 +313,73 @@ async function insertJob(env: Env, input: {
   return { row: inserted, duplicate: false };
 }
 
-async function submitJob(request: Request, env: Env): Promise<Response> {
+async function submitResearch(request: Request, env: Env): Promise<Response> {
+  const input = await body<{
+    task?: string;
+    context?: JsonValue;
+    instructions?: string | string[];
+    request_key?: string;
+    priority?: number;
+    max_attempts?: number;
+  }>(request);
+
+  let payload: JsonValue;
+  try {
+    payload = normalizeResearchPayload(input);
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : "invalid_research_task" }, 400);
+  }
+
+  const created = await insertJob(env, {
+    kind: RESEARCH_KIND,
+    payload,
+    request_key: input.request_key,
+    priority: input.priority,
+    max_attempts: input.max_attempts,
+  });
+
+  return json({ job: publicJob(created.row), duplicate: created.duplicate }, created.duplicate ? 200 : 201);
+}
+
+async function importResearch(request: Request, env: Env): Promise<Response> {
+  const input = await body<{
+    format?: string;
+    jobs?: Array<{
+      task?: string;
+      context?: JsonValue;
+      instructions?: string | string[];
+      request_key?: string;
+      priority?: number;
+      max_attempts?: number;
+    }>;
+  }>(request);
+
+  if (input.format !== RESEARCH_INPUT_FORMAT || !Array.isArray(input.jobs)) {
+    return json({ error: "invalid_research_bundle", expected_format: RESEARCH_INPUT_FORMAT }, 400);
+  }
+  if (input.jobs.length > 500) return json({ error: "too_many_jobs", max: 500 }, 400);
+
+  const imported: unknown[] = [];
+  for (let index = 0; index < input.jobs.length; index += 1) {
+    try {
+      const item = input.jobs[index];
+      const payload = normalizeResearchPayload(item);
+      const created = await insertJob(env, {
+        kind: RESEARCH_KIND,
+        payload,
+        request_key: item.request_key,
+        priority: item.priority,
+        max_attempts: item.max_attempts,
+      });
+      imported.push({ index, id: created.row.id, duplicate: created.duplicate, status: created.row.status });
+    } catch (error) {
+      imported.push({ index, error: error instanceof Error ? error.message : "invalid_research_task" });
+    }
+  }
+  return json({ format: RESEARCH_INPUT_FORMAT, imported });
+}
+
+async function submitAdvancedJob(request: Request, env: Env): Promise<Response> {
   const input = await body<{
     kind?: string;
     payload?: JsonValue;
@@ -224,7 +397,7 @@ async function submitJob(request: Request, env: Env): Promise<Response> {
   }
 }
 
-async function importJobs(request: Request, env: Env): Promise<Response> {
+async function importAdvancedJobs(request: Request, env: Env): Promise<Response> {
   const input = await body<{
     format?: string;
     jobs?: Array<{
@@ -235,8 +408,8 @@ async function importJobs(request: Request, env: Env): Promise<Response> {
       max_attempts?: number;
     }>;
   }>(request);
-  if (input.format !== JOB_IMPORT_FORMAT || !Array.isArray(input.jobs)) {
-    return json({ error: "invalid_job_bundle", expected_format: JOB_IMPORT_FORMAT }, 400);
+  if (input.format !== ADVANCED_JOB_FORMAT || !Array.isArray(input.jobs)) {
+    return json({ error: "invalid_job_bundle", expected_format: ADVANCED_JOB_FORMAT }, 400);
   }
   if (input.jobs.length > 500) return json({ error: "too_many_jobs", max: 500 }, 400);
 
@@ -249,7 +422,7 @@ async function importJobs(request: Request, env: Env): Promise<Response> {
       imported.push({ index, error: error instanceof Error ? error.message : "invalid_job" });
     }
   }
-  return json({ format: JOB_IMPORT_FORMAT, imported });
+  return json({ format: ADVANCED_JOB_FORMAT, imported });
 }
 
 async function listJobs(request: Request, env: Env): Promise<Response> {
@@ -280,33 +453,39 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
   return json({ jobs: result.results.map(publicJob) });
 }
 
-async function exportJobs(request: Request, env: Env): Promise<Response> {
+async function exportResearchInput(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const status = cleanText(url.searchParams.get("status"), 20) ?? "queued";
-  const kind = cleanText(url.searchParams.get("kind"), 100);
   const limit = clampInt(Number(url.searchParams.get("limit") ?? 100), 100, 1, 500);
   if (!["queued", "claimed", "completed", "failed"].includes(status)) return json({ error: "invalid_status" }, 400);
 
-  const query = kind
-    ? "SELECT * FROM jobs WHERE status = ? AND kind = ? ORDER BY priority DESC, created_at ASC LIMIT ?"
-    : "SELECT * FROM jobs WHERE status = ? ORDER BY priority DESC, created_at ASC LIMIT ?";
-  const statement = env.DB.prepare(query);
-  const result = kind
-    ? await statement.bind(status, kind, limit).all<JobRow>()
-    : await statement.bind(status, limit).all<JobRow>();
+  const result = await env.DB.prepare(`
+    SELECT * FROM jobs
+    WHERE kind = ? AND status = ?
+    ORDER BY priority DESC, created_at ASC
+    LIMIT ?
+  `).bind(RESEARCH_KIND, status, limit).all<JobRow>();
 
-  const bundle = {
-    format: JOB_IMPORT_FORMAT,
-    exported_at: new Date().toISOString(),
-    jobs: result.results.map((row) => ({
+  const jobs = result.results.map((row) => {
+    const payload = parseStoredJson(row.payload);
+    const value = payload && typeof payload === "object" && !Array.isArray(payload)
+      ? payload as { [key: string]: JsonValue }
+      : {};
+    return {
       request_key: row.request_key,
-      kind: row.kind,
-      payload: parseStoredJson(row.payload),
+      task: value.task ?? null,
+      context: value.context ?? null,
+      instructions: value.extra_instructions ?? [],
       priority: row.priority,
       max_attempts: row.max_attempts,
-    })),
-  };
-  return json(bundle, 200, { "content-disposition": 'attachment; filename="research-jobs.json"' });
+    };
+  });
+
+  return json({
+    format: RESEARCH_INPUT_FORMAT,
+    exported_at: new Date().toISOString(),
+    jobs,
+  }, 200, { "content-disposition": 'attachment; filename="research-input.json"' });
 }
 
 async function claimOne(env: Env, workerId: string, leaseSeconds: number): Promise<JobRow | null> {
@@ -340,13 +519,23 @@ async function claimOne(env: Env, workerId: string, leaseSeconds: number): Promi
   return claimed;
 }
 
+function claimedJobForWorker(row: JobRow) {
+  const payload = parseStoredJson(row.payload);
+  return {
+    ...publicJob(row),
+    claim_token: row.claim_token,
+    prompt: row.kind === RESEARCH_KIND ? researchPrompt(payload) : JSON.stringify(payload, null, 2),
+    response_format: row.kind === RESEARCH_KIND ? researchResponseFormat() : null,
+  };
+}
+
 async function claimJob(request: Request, env: Env): Promise<Response> {
   const input = await body<{ worker_id?: string; lease_seconds?: number }>(request);
   const workerId = cleanText(input.worker_id, 200);
   if (!workerId) return json({ error: "invalid_worker_id" }, 400);
   const leaseSeconds = clampInt(input.lease_seconds, 300, 30, 1800);
   const claimed = await claimOne(env, workerId, leaseSeconds);
-  return json({ job: claimed ? workerJob(claimed) : null });
+  return json({ job: claimed ? claimedJobForWorker(claimed) : null });
 }
 
 async function heartbeatJob(request: Request, env: Env, id: string): Promise<Response> {
@@ -371,7 +560,7 @@ async function heartbeatJob(request: Request, env: Env, id: string): Promise<Res
 
   if (!updated) return json({ error: "claim_not_owned_or_expired" }, 409);
   await addEvent(env, id, "heartbeat", workerId, { lease_seconds: leaseSeconds });
-  return json({ job: workerJob(updated) });
+  return json({ job: claimedJobForWorker(updated) });
 }
 
 async function createProposalFromClaim(
@@ -386,6 +575,7 @@ async function createProposalFromClaim(
   const condition = workerId
     ? "id = ? AND status = 'claimed' AND claimed_by = ? AND claim_token = ? AND lease_expires_at > CURRENT_TIMESTAMP"
     : "id = ? AND status = 'claimed' AND claim_token = ? AND lease_expires_at > CURRENT_TIMESTAMP";
+
   const statement = env.DB.prepare(`
     UPDATE jobs
     SET status = 'completed',
@@ -400,6 +590,7 @@ async function createProposalFromClaim(
     WHERE ${condition}
     RETURNING *
   `);
+
   const encoded = JSON.stringify(result);
   const updated = workerId
     ? await statement.bind(encoded, id, workerId, claimToken).first<JobRow>()
@@ -413,7 +604,11 @@ async function createProposalFromClaim(
     RETURNING *
   `).bind(proposalId, id, sourceType, sourceId, encoded).first<ProposalRow>();
   if (!proposal) throw new Error("proposal_insert_failed");
-  await addEvent(env, id, "proposal_submitted", sourceId, { proposal_id: proposalId, source_type: sourceType });
+
+  await addEvent(env, id, "proposal_submitted", sourceId, {
+    proposal_id: proposalId,
+    source_type: sourceType,
+  });
   return { job: updated, proposal };
 }
 
@@ -428,7 +623,15 @@ async function proposeJob(request: Request, env: Env, id: string): Promise<Respo
   if (!workerId || !claimToken) return json({ error: "claim_credentials_required" }, 400);
   if (!("result" in input)) return json({ error: "result_required" }, 400);
 
-  const completed = await createProposalFromClaim(env, id, claimToken, input.result as JsonValue, "worker", workerId, workerId);
+  const completed = await createProposalFromClaim(
+    env,
+    id,
+    claimToken,
+    input.result as JsonValue,
+    "worker",
+    workerId,
+    workerId,
+  );
   if (!completed) return json({ error: "claim_not_owned_or_expired" }, 409);
   return json({ job: publicJob(completed.job), proposal: publicProposal(completed.proposal) });
 }
@@ -465,7 +668,15 @@ async function failJob(request: Request, env: Env, id: string): Promise<Response
       AND claim_token = ?
       AND lease_expires_at > CURRENT_TIMESTAMP
     RETURNING *
-  `).bind(retry ? 1 : 0, retry ? 1 : 0, retryAfter, message, id, workerId, claimToken).first<JobRow>();
+  `).bind(
+    retry ? 1 : 0,
+    retry ? 1 : 0,
+    retryAfter,
+    message,
+    id,
+    workerId,
+    claimToken,
+  ).first<JobRow>();
 
   if (!updated) return json({ error: "claim_not_owned_or_expired" }, 409);
   await addEvent(env, id, updated.status === "queued" ? "retry_scheduled" : "failed", workerId, { error: message });
@@ -488,10 +699,9 @@ async function listProposals(request: Request, env: Env): Promise<Response> {
   if (!["pending", "accepted", "rejected"].includes(reviewStatus)) return json({ error: "invalid_review_status" }, 400);
 
   const result = await env.DB.prepare(`
-    SELECT p.*
-    FROM proposals p
-    WHERE p.review_status = ?
-    ORDER BY p.created_at ASC
+    SELECT * FROM proposals
+    WHERE review_status = ?
+    ORDER BY created_at ASC
     LIMIT ?
   `).bind(reviewStatus, limit).all<ProposalRow>();
 
@@ -511,20 +721,23 @@ async function reviewProposal(request: Request, env: Env, proposalId: string): P
     requeue?: boolean;
   }>(request);
   if (input.decision !== "accepted" && input.decision !== "rejected") return json({ error: "invalid_decision" }, 400);
+
   const reviewer = cleanText(input.reviewer, 200) ?? "client";
   const notes = cleanText(input.notes, 4000);
-
   const proposal = await env.DB.prepare(`
     UPDATE proposals
     SET review_status = ?, reviewed_by = ?, review_notes = ?, reviewed_at = CURRENT_TIMESTAMP
     WHERE id = ? AND review_status = 'pending'
     RETURNING *
   `).bind(input.decision, reviewer, notes, proposalId).first<ProposalRow>();
+
   if (!proposal) return json({ error: "proposal_not_pending" }, 409);
+  await addEvent(env, proposal.job_id, `proposal_${input.decision}`, reviewer, {
+    proposal_id: proposalId,
+    notes,
+  });
 
-  await addEvent(env, proposal.job_id, `proposal_${input.decision}`, reviewer, { proposal_id: proposalId, notes });
-
-  let job: JobRow | null = null;
+  let job: JobRow | null;
   if (input.decision === "rejected" && input.requeue === true) {
     job = await env.DB.prepare(`
       UPDATE jobs
@@ -539,6 +752,48 @@ async function reviewProposal(request: Request, env: Env, proposalId: string): P
   }
 
   return json({ proposal: publicProposal(proposal), job: job ? publicJob(job) : null });
+}
+
+function offlineResponseInstructions() {
+  return {
+    output_mode: "json_only",
+    instruction:
+      "Return exactly one valid JSON object matching this response_format. Do not wrap it in Markdown fences and do not add prose outside the JSON.",
+    top_level_format: OFFLINE_PROPOSALS_FORMAT,
+    required_top_level_fields: ["format", "batch_id", "researcher", "proposals"],
+    field_rules: {
+      format: `Must equal ${OFFLINE_PROPOSALS_FORMAT}`,
+      batch_id: "Copy batch_id exactly from the input bundle.",
+      researcher: "Name/model identifier used to perform the research.",
+      proposals: "Return exactly one item for each job you researched.",
+    },
+    proposal_fields: {
+      job_id: "Copy job_id exactly from the corresponding input job.",
+      claim_token: "Copy claim_token exactly from the corresponding input job.",
+      result: researchResponseFormat().result_schema,
+    },
+    result_rules: researchRules(),
+    example: {
+      format: OFFLINE_PROPOSALS_FORMAT,
+      batch_id: "COPY_FROM_INPUT",
+      researcher: "model-name",
+      proposals: [
+        {
+          job_id: "COPY_FROM_JOB",
+          claim_token: "COPY_FROM_JOB",
+          result: {
+            resolution: "unresolved",
+            proposed_value: null,
+            evidence: [],
+            reasoning: "The available evidence did not establish the requested fact for the required identity.",
+            confidence: "low",
+            conflicts: [],
+            research_notes: "Optional notes.",
+          },
+        },
+      ],
+    },
+  };
 }
 
 async function offlineExport(request: Request, env: Env): Promise<Response> {
@@ -557,11 +812,13 @@ async function offlineExport(request: Request, env: Env): Promise<Response> {
   for (let i = 0; i < limit; i += 1) {
     const claimed = await claimOne(env, workerId, leaseSeconds);
     if (!claimed) break;
+    const payload = parseStoredJson(claimed.payload);
     jobs.push({
       job_id: claimed.id,
       claim_token: claimed.claim_token,
       kind: claimed.kind,
-      research_task: parseStoredJson(claimed.payload),
+      research_task: payload,
+      prompt: claimed.kind === RESEARCH_KIND ? researchPrompt(payload) : JSON.stringify(payload, null, 2),
     });
   }
 
@@ -571,24 +828,9 @@ async function offlineExport(request: Request, env: Env): Promise<Response> {
     researcher,
     exported_at: new Date().toISOString(),
     lease_seconds: leaseSeconds,
-    instructions: [
-      "Research each job independently using the research_task instructions.",
-      "Do not guess. If the evidence is insufficient, return resolution=unresolved.",
-      "Preserve the supplied job_id and claim_token exactly.",
-      `Return JSON using format ${OFFLINE_PROPOSALS_FORMAT}.`,
-    ],
-    proposal_shape: {
-      job_id: "<copied job_id>",
-      claim_token: "<copied claim_token>",
-      result: {
-        resolution: "proposed | unresolved",
-        proposed_value: "<value or null>",
-        evidence: [],
-        reasoning: "<concise reasoning>",
-        confidence: "high | medium | low",
-        conflicts: [],
-      },
-    },
+    instructions:
+      "Give this entire JSON file to the research model. It contains all task instructions and the exact required response format. The model should return a JSON file only.",
+    response_format: offlineResponseInstructions(),
     jobs,
   };
 
@@ -608,13 +850,15 @@ async function offlineImport(request: Request, env: Env): Promise<Response> {
       result?: JsonValue;
     }>;
   }>(request);
+
   if (input.format !== OFFLINE_PROPOSALS_FORMAT || !Array.isArray(input.proposals)) {
     return json({ error: "invalid_offline_bundle", expected_format: OFFLINE_PROPOSALS_FORMAT }, 400);
   }
   if (input.proposals.length > 200) return json({ error: "too_many_proposals", max: 200 }, 400);
-  const researcher = cleanText(input.researcher, 120) ?? cleanText(input.batch_id, 120) ?? "manual-model";
 
+  const researcher = cleanText(input.researcher, 120) ?? cleanText(input.batch_id, 120) ?? "manual-model";
   const imported: unknown[] = [];
+
   for (let index = 0; index < input.proposals.length; index += 1) {
     const item = input.proposals[index];
     const jobId = cleanText(item.job_id, 100);
@@ -623,6 +867,7 @@ async function offlineImport(request: Request, env: Env): Promise<Response> {
       imported.push({ index, error: "job_id_claim_token_and_result_required" });
       continue;
     }
+
     const completed = await createProposalFromClaim(
       env,
       jobId,
@@ -643,6 +888,7 @@ async function offlineImport(request: Request, env: Env): Promise<Response> {
       review_status: completed.proposal.review_status,
     });
   }
+
   return json({ format: OFFLINE_PROPOSALS_FORMAT, imported });
 }
 
@@ -657,11 +903,14 @@ export default {
 
       if (url.pathname.startsWith("/v1/worker/")) {
         if (!authorized(request, env.WORKER_TOKEN)) return json({ error: "unauthorized" }, 401);
+
         if (request.method === "POST" && url.pathname === "/v1/worker/claim") return claimJob(request, env);
+
         const workerMatch = url.pathname.match(/^\/v1\/worker\/jobs\/([0-9a-f-]+)\/(heartbeat|propose|fail)$/i);
         if (!workerMatch) return json({ error: "not_found" }, 404);
-        const [, id, action] = workerMatch;
         if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+
+        const [, id, action] = workerMatch;
         if (action === "heartbeat") return heartbeatJob(request, env, id);
         if (action === "propose") return proposeJob(request, env, id);
         return failJob(request, env, id);
@@ -670,13 +919,17 @@ export default {
       if (!url.pathname.startsWith("/v1/")) return json({ error: "not_found" }, 404);
       if (!authorized(request, env.CLIENT_TOKEN)) return json({ error: "unauthorized" }, 401);
 
-      if (request.method === "POST" && url.pathname === "/v1/jobs") return submitJob(request, env);
+      if (request.method === "POST" && url.pathname === "/v1/research") return submitResearch(request, env);
+      if (request.method === "POST" && url.pathname === "/v1/research/import") return importResearch(request, env);
+      if (request.method === "GET" && url.pathname === "/v1/research/export") return exportResearchInput(request, env);
+
       if (request.method === "GET" && url.pathname === "/v1/jobs") return listJobs(request, env);
-      if (request.method === "POST" && url.pathname === "/v1/jobs/import") return importJobs(request, env);
-      if (request.method === "GET" && url.pathname === "/v1/jobs/export") return exportJobs(request, env);
       if (request.method === "GET" && url.pathname === "/v1/proposals") return listProposals(request, env);
       if (request.method === "POST" && url.pathname === "/v1/offline/export") return offlineExport(request, env);
       if (request.method === "POST" && url.pathname === "/v1/offline/import") return offlineImport(request, env);
+
+      if (request.method === "POST" && url.pathname === "/v1/jobs") return submitAdvancedJob(request, env);
+      if (request.method === "POST" && url.pathname === "/v1/jobs/import") return importAdvancedJobs(request, env);
 
       const jobMatch = url.pathname.match(/^\/v1\/jobs\/([0-9a-f-]+)$/i);
       if (jobMatch && request.method === "GET") return getJob(env, jobMatch[1]);
