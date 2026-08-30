@@ -1,0 +1,20 @@
+name: Temporary custom-domain probe
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe canonical health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "HTTPS response:"
+          curl --fail-with-body -sS -D headers.txt https://gemini-research-bridge.laptopvalue.co.uk/health -o health.json
+          cat health.json
+          echo
+          echo "HTTP redirect response:"
+          curl -sS -I http://gemini-research-bridge.laptopvalue.co.uk/ | head -n 10
