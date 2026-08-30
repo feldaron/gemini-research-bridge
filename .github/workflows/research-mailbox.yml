@@ -1,0 +1,239 @@
+name: Research mailbox
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: research-mailbox-${{ github.event.issue.number || 'sync' }}
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLIENT_TOKEN: ${{ secrets.CLIENT_TOKEN }}
+      BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - name: Extract and submit bridge task
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${CLIENT_TOKEN:-}" || { echo "CLIENT_TOKEN is not configured"; exit 1; }
+
+          python3 - <<'PY' > task.json
+          import json, os
+          event = json.load(open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8'))
+          body = event['issue'].get('body') or ''
+          start = '<!-- gemini-research-bridge:task:v1'
+          end = '-->'
+          if start not in body:
+              raise SystemExit(78)
+          payload = body.split(start, 1)[1].split(end, 1)[0].strip()
+          data = json.loads(payload)
+          if not isinstance(data, dict) or not str(data.get('task', '')).strip():
+              raise SystemExit('Mailbox task must contain a non-empty task')
+          data['request_key'] = f"github-issue:{event['issue']['number']}"
+          json.dump(data, open('task.json', 'w', encoding='utf-8'), ensure_ascii=False)
+          PY
+
+          if [ ! -s task.json ]; then
+            echo "No bridge task marker found; nothing to do."
+            exit 0
+          fi
+
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $CLIENT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "$BRIDGE_URL/v1/research" \
+            --data @task.json > submitted.json
+
+          job_id=$(jq -r '.job.id' submitted.json)
+          status=$(jq -r '.job.status' submitted.json)
+          duplicate=$(jq -r '.duplicate' submitted.json)
+          marker="<!-- bridge-job:${job_id} -->"
+
+          existing=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" --paginate \
+            --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1 || true)
+
+          body=$(cat <<EOF
+          ${marker}
+          ### Research bridge
+          **Job:** \`${job_id}\`  
+          **Status:** **${status}**  
+          **Submission:** $([ "$duplicate" = "true" ] && echo "already linked (idempotent)" || echo "queued")
+
+          The Cloudflare bridge is now authoritative for this research task. Progress and proposals will be synced back to this issue.
+          EOF
+          )
+
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -f body="$body" >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" -f body="$body" >/dev/null
+          fi
+
+  review:
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request == null
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLIENT_TOKEN: ${{ secrets.CLIENT_TOKEN }}
+      BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      COMMENT_BODY: ${{ github.event.comment.body }}
+    steps:
+      - name: Apply review command
+        shell: bash
+        run: |
+          set -euo pipefail
+          command=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | head -n1)
+          action=$(printf '%s' "$command" | awk '{print $1}')
+          proposal_id=$(printf '%s' "$command" | awk '{print $2}')
+
+          case "$action" in
+            /accept) decision=accepted; requeue=false ;;
+            /reject) decision=rejected; requeue=false ;;
+            /research-again) decision=rejected; requeue=true ;;
+            *) echo "Not a bridge review command."; exit 0 ;;
+          esac
+
+          if ! printf '%s' "$proposal_id" | grep -Eq '^[0-9a-fA-F-]{20,}$'; then
+            echo "Invalid proposal id"
+            exit 1
+          fi
+
+          jq -n \
+            --arg decision "$decision" \
+            --arg reviewer "chatgpt-github-mailbox" \
+            --arg notes "Reviewed from GitHub issue #${ISSUE_NUMBER}." \
+            --argjson requeue "$requeue" \
+            '{decision:$decision, reviewer:$reviewer, notes:$notes, requeue:$requeue}' > review.json
+
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $CLIENT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "$BRIDGE_URL/v1/proposals/${proposal_id}/review" \
+            --data @review.json > reviewed.json
+
+          resulting=$(jq -r '.proposal.review_status' reviewed.json)
+          job_status=$(jq -r '.job.status' reviewed.json)
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="Review applied to proposal \`${proposal_id}\`: **${resulting}**. Job status: **${job_status}**." >/dev/null
+
+  sync:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLIENT_TOKEN: ${{ secrets.CLIENT_TOKEN }}
+      BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
+    steps:
+      - name: Sync active progress
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${CLIENT_TOKEN:-}" || { echo "CLIENT_TOKEN is not configured"; exit 1; }
+
+          : > active.ndjson
+          for status in queued claimed failed; do
+            curl --fail-with-body -sS \
+              -H "Authorization: Bearer $CLIENT_TOKEN" \
+              "$BRIDGE_URL/v1/jobs?status=${status}&kind=research&limit=500" \
+              | jq -c '.jobs[] | select(.request_key != null and (.request_key | startswith("github-issue:")))' \
+              >> active.ndjson
+          done
+
+          while IFS= read -r job; do
+            [ -n "$job" ] || continue
+            issue=$(printf '%s' "$job" | jq -r '.request_key | split(":")[-1]')
+            job_id=$(printf '%s' "$job" | jq -r '.id')
+            status=$(printf '%s' "$job" | jq -r '.status')
+            claimed_by=$(printf '%s' "$job" | jq -r '.claimed_by // "—"')
+            heartbeat=$(printf '%s' "$job" | jq -r '.heartbeat_at // "—"')
+            attempts=$(printf '%s' "$job" | jq -r '.attempts')
+            max_attempts=$(printf '%s' "$job" | jq -r '.max_attempts')
+            error=$(printf '%s' "$job" | jq -r '.error // ""')
+            marker="<!-- bridge-status:${job_id} -->"
+
+            body=$(cat <<EOF
+          ${marker}
+          ### Research progress
+          **Status:** **${status}**  
+          **Worker:** ${claimed_by}  
+          **Attempts:** ${attempts}/${max_attempts}  
+          **Last heartbeat:** ${heartbeat}$([ -n "$error" ] && printf '  \n**Error:** %s' "$error")
+          EOF
+          )
+
+            existing=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${issue}/comments" --paginate \
+              --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1 || true)
+            if [ -n "$existing" ]; then
+              current=$(gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" --jq '.body')
+              [ "$current" = "$body" ] || gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -f body="$body" >/dev/null
+            else
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${issue}/comments" -f body="$body" >/dev/null
+            fi
+          done < active.ndjson
+
+      - name: Sync pending proposals
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $CLIENT_TOKEN" \
+            "$BRIDGE_URL/v1/proposals?review_status=pending&limit=500" > proposals.json
+
+          jq -c '.proposals[] | select(.job.request_key != null and (.job.request_key | startswith("github-issue:")))' proposals.json > proposals.ndjson
+
+          while IFS= read -r row; do
+            [ -n "$row" ] || continue
+            issue=$(printf '%s' "$row" | jq -r '.job.request_key | split(":")[-1]')
+            proposal_id=$(printf '%s' "$row" | jq -r '.proposal.id')
+            marker="<!-- bridge-proposal:${proposal_id} -->"
+
+            exists=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${issue}/comments" --paginate \
+              --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1 || true)
+            [ -z "$exists" ] || continue
+
+            printf '%s' "$row" | jq -r --arg marker "$marker" '
+              .proposal.result as $r |
+              [$marker,
+               "### Antigravity research proposal",
+               "**Proposal:** `" + .proposal.id + "`  ",
+               "**Resolution:** **" + ($r.resolution // "unknown") + "**  ",
+               "**Confidence:** " + ($r.confidence // "unknown") + "  ",
+               "**Proposed value:** `" + (($r.proposed_value // null) | tostring) + "`",
+               "",
+               "#### Reasoning",
+               ($r.reasoning // "—"),
+               "",
+               "#### Evidence",
+               (if (($r.evidence // []) | length) == 0 then "No evidence returned."
+                else (($r.evidence // []) | map("- [" + (.source_title // "Source") + "](" + (.url // "") + ") — " + (.evidence_text // "") + "\n  - Applies to: " + (.applies_to // "—") + "\n  - Applicability: " + (.applicability // "—")) | join("\n")) end),
+               "",
+               "#### Conflicts",
+               (if (($r.conflicts // []) | length) == 0 then "None reported." else (($r.conflicts // []) | map("- " + tostring) | join("\n")) end),
+               "",
+               "#### Review from ChatGPT",
+               "Comment one of:",
+               "- `/accept " + .proposal.id + "`",
+               "- `/reject " + .proposal.id + "`",
+               "- `/research-again " + .proposal.id + "`"
+              ] | join("\n")' > proposal.md
+
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${issue}/comments" \
+              -F body=@proposal.md >/dev/null
+          done < proposals.ndjson
