@@ -2,6 +2,8 @@
 
 Standalone Cloudflare Worker + D1 service for handing research tasks to Gemini or any other research model and returning **proposals** for a separate controller to review.
 
+Canonical API endpoint: `https://gemini-research-bridge.laptopvalue.co.uk`
+
 This repository is deliberately independent of Laptop Value and Supabase. The bridge has no Supabase credentials and cannot write canonical facts.
 
 ## Trust model
@@ -32,7 +34,7 @@ Controller reviews and decides what, if anything, is written elsewhere
 
 The normal input API intentionally requires very little formatting:
 
-`POST /v1/research`
+`POST https://gemini-research-bridge.laptopvalue.co.uk/v1/research`
 
 ```json
 {
@@ -87,8 +89,9 @@ Do not reuse the same value for both roles and do not commit either token.
 
 ## Cloudflare resources
 
-The service expects:
+The service uses:
 
+- Canonical domain: `https://gemini-research-bridge.laptopvalue.co.uk`
 - Worker name: `gemini-research-bridge`
 - D1 binding: `DB`
 - D1 database: `gemini-research-bridge`
