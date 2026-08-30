@@ -37,6 +37,9 @@ jobs:
           token=${token#\'}; token=${token%\'}
           echo "CLOUDFLARE_API_TOKEN=${token}" >> "$GITHUB_ENV"
 
+      - name: Apply remote D1 migrations
+        run: npx wrangler d1 migrations apply gemini-research-bridge --remote
+
       - name: Install Worker role secrets
         shell: bash
         run: |
