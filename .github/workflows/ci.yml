@@ -15,4 +15,17 @@ jobs:
           node-version: 22
       - run: npm install
       - run: npm run typecheck
+      - name: Validate PowerShell worker scripts
+        shell: pwsh
+        run: |
+          $files = @("worker/worker.ps1", "worker/install.ps1")
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$file: $($_.Message)" }
+              exit 1
+            }
+          }
       - run: npx wrangler deploy --dry-run
