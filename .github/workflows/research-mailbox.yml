@@ -133,6 +133,11 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
             -f body="Review applied to proposal \`${proposal_id}\`: **${resulting}**. Job status: **${job_status}**." >/dev/null
 
+          if [ "$requeue" = "false" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" \
+              -f state=closed -f state_reason=completed >/dev/null
+          fi
+
   sync:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
