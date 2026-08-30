@@ -48,6 +48,14 @@ const RESEARCH_INPUT_FORMAT = "gemini-research-bridge.research-input.v1";
 const OFFLINE_JOBS_FORMAT = "gemini-research-bridge.offline-jobs.v1";
 const OFFLINE_PROPOSALS_FORMAT = "gemini-research-bridge.offline-proposals.v1";
 const ADVANCED_JOB_FORMAT = "gemini-research-bridge.jobs.v1";
+const RESEARCH_SOURCE_TYPES = [
+  "manufacturer",
+  "professional_review",
+  "retailer",
+  "documentation",
+  "database",
+  "other",
+] as const;
 
 function json(data: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data, null, 2), {
@@ -245,6 +253,40 @@ function researchPrompt(payload: JsonValue): string {
     "Follow the rules and return only the requested JSON result object.",
     JSON.stringify(contract, null, 2),
   ].join("\n\n");
+}
+
+function validateResearchResult(value: JsonValue): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "result_must_be_object";
+  const result = value as { [key: string]: JsonValue };
+
+  if (result.resolution !== "proposed" && result.resolution !== "unresolved") return "invalid_resolution";
+  if (!("proposed_value" in result)) return "proposed_value_required";
+  if (!Array.isArray(result.evidence)) return "evidence_must_be_array";
+  if (!cleanText(result.reasoning, 20000)) return "reasoning_required";
+  if (!["high", "medium", "low"].includes(String(result.confidence ?? ""))) return "invalid_confidence";
+  if (!Array.isArray(result.conflicts)) return "conflicts_must_be_array";
+
+  if (result.resolution === "unresolved" && result.proposed_value !== null) {
+    return "unresolved_proposed_value_must_be_null";
+  }
+  if (result.resolution === "proposed" && result.evidence.length === 0) {
+    return "proposed_resolution_requires_evidence";
+  }
+
+  for (const item of result.evidence) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return "invalid_evidence_item";
+    const evidence = item as { [key: string]: JsonValue };
+    if (!cleanText(evidence.url, 4000)) return "evidence_url_required";
+    if (!cleanText(evidence.source_title, 1000)) return "evidence_source_title_required";
+    if (!RESEARCH_SOURCE_TYPES.includes(String(evidence.source_type) as typeof RESEARCH_SOURCE_TYPES[number])) {
+      return "invalid_evidence_source_type";
+    }
+    if (!cleanText(evidence.evidence_text, 12000)) return "evidence_text_required";
+    if (!cleanText(evidence.applies_to, 4000)) return "evidence_applies_to_required";
+    if (!cleanText(evidence.applicability, 8000)) return "evidence_applicability_required";
+  }
+
+  return null;
 }
 
 async function addEvent(
@@ -488,7 +530,12 @@ async function exportResearchInput(request: Request, env: Env): Promise<Response
   }, 200, { "content-disposition": 'attachment; filename="research-input.json"' });
 }
 
-async function claimOne(env: Env, workerId: string, leaseSeconds: number): Promise<JobRow | null> {
+async function claimOne(
+  env: Env,
+  workerId: string,
+  leaseSeconds: number,
+  kind: string,
+): Promise<JobRow | null> {
   const claimToken = crypto.randomUUID();
   const claimed = await env.DB.prepare(`
     UPDATE jobs
@@ -503,7 +550,8 @@ async function claimOne(env: Env, workerId: string, leaseSeconds: number): Promi
     WHERE id = (
       SELECT id
       FROM jobs
-      WHERE available_at <= CURRENT_TIMESTAMP
+      WHERE kind = ?
+        AND available_at <= CURRENT_TIMESTAMP
         AND attempts < max_attempts
         AND (
           status = 'queued'
@@ -513,7 +561,7 @@ async function claimOne(env: Env, workerId: string, leaseSeconds: number): Promi
       LIMIT 1
     )
     RETURNING *
-  `).bind(workerId, claimToken, leaseSeconds).first<JobRow>();
+  `).bind(workerId, claimToken, leaseSeconds, kind).first<JobRow>();
 
   if (claimed) await addEvent(env, claimed.id, "claimed", workerId, { lease_seconds: leaseSeconds });
   return claimed;
@@ -534,7 +582,7 @@ async function claimJob(request: Request, env: Env): Promise<Response> {
   const workerId = cleanText(input.worker_id, 200);
   if (!workerId) return json({ error: "invalid_worker_id" }, 400);
   const leaseSeconds = clampInt(input.lease_seconds, 300, 30, 1800);
-  const claimed = await claimOne(env, workerId, leaseSeconds);
+  const claimed = await claimOne(env, workerId, leaseSeconds, RESEARCH_KIND);
   return json({ job: claimed ? claimedJobForWorker(claimed) : null });
 }
 
@@ -561,6 +609,14 @@ async function heartbeatJob(request: Request, env: Env, id: string): Promise<Res
   if (!updated) return json({ error: "claim_not_owned_or_expired" }, 409);
   await addEvent(env, id, "heartbeat", workerId, { lease_seconds: leaseSeconds });
   return json({ job: claimedJobForWorker(updated) });
+}
+
+async function validateResultForJob(env: Env, id: string, result: JsonValue): Promise<string | null> {
+  const job = await env.DB.prepare("SELECT kind FROM jobs WHERE id = ?")
+    .bind(id)
+    .first<{ kind: string }>();
+  if (!job) return "job_not_found";
+  return job.kind === RESEARCH_KIND ? validateResearchResult(result) : null;
 }
 
 async function createProposalFromClaim(
@@ -623,11 +679,15 @@ async function proposeJob(request: Request, env: Env, id: string): Promise<Respo
   if (!workerId || !claimToken) return json({ error: "claim_credentials_required" }, 400);
   if (!("result" in input)) return json({ error: "result_required" }, 400);
 
+  const result = input.result as JsonValue;
+  const validationError = await validateResultForJob(env, id, result);
+  if (validationError) return json({ error: "invalid_research_result", detail: validationError }, 422);
+
   const completed = await createProposalFromClaim(
     env,
     id,
     claimToken,
-    input.result as JsonValue,
+    result,
     "worker",
     workerId,
     workerId,
@@ -810,7 +870,7 @@ async function offlineExport(request: Request, env: Env): Promise<Response> {
   const jobs: unknown[] = [];
 
   for (let i = 0; i < limit; i += 1) {
-    const claimed = await claimOne(env, workerId, leaseSeconds);
+    const claimed = await claimOne(env, workerId, leaseSeconds, RESEARCH_KIND);
     if (!claimed) break;
     const payload = parseStoredJson(claimed.payload);
     jobs.push({
@@ -818,7 +878,7 @@ async function offlineExport(request: Request, env: Env): Promise<Response> {
       claim_token: claimed.claim_token,
       kind: claimed.kind,
       research_task: payload,
-      prompt: claimed.kind === RESEARCH_KIND ? researchPrompt(payload) : JSON.stringify(payload, null, 2),
+      prompt: researchPrompt(payload),
     });
   }
 
@@ -868,11 +928,18 @@ async function offlineImport(request: Request, env: Env): Promise<Response> {
       continue;
     }
 
+    const result = item.result as JsonValue;
+    const validationError = await validateResultForJob(env, jobId, result);
+    if (validationError) {
+      imported.push({ index, job_id: jobId, error: "invalid_research_result", detail: validationError });
+      continue;
+    }
+
     const completed = await createProposalFromClaim(
       env,
       jobId,
       claimToken,
-      item.result as JsonValue,
+      result,
       "offline",
       researcher,
       null,
@@ -898,7 +965,18 @@ export default {
       const url = new URL(request.url);
 
       if (request.method === "GET" && url.pathname === "/health") {
-        return json({ ok: true, service: "gemini-research-bridge", version: 1 });
+        const bindings = {
+          db: Boolean(env.DB),
+          client_auth: Boolean(env.CLIENT_TOKEN),
+          worker_auth: Boolean(env.WORKER_TOKEN),
+        };
+        return json({
+          ok: true,
+          service: "gemini-research-bridge",
+          version: 1,
+          ready: bindings.db && bindings.client_auth && bindings.worker_auth,
+          bindings,
+        });
       }
 
       if (url.pathname.startsWith("/v1/worker/")) {
