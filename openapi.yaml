@@ -1,0 +1,151 @@
+openapi: 3.1.0
+info:
+  title: Gemini Research Bridge Controller API
+  version: 1.0.0
+  description: >-
+    Controller-only API for submitting research tasks and reviewing proposed
+    resolutions. Research workers never write to the controller's source database.
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      operationId: health
+      security: []
+      summary: Check bridge health
+      responses:
+        '200':
+          description: Healthy
+  /v1/research:
+    post:
+      operationId: submitResearch
+      summary: Submit a simple research task
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task]
+              properties:
+                task:
+                  type: string
+                context: {}
+                instructions:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items:
+                        type: string
+                request_key:
+                  type: string
+                priority:
+                  type: integer
+                  minimum: -100
+                  maximum: 100
+                max_attempts:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+      responses:
+        '200':
+          description: Existing deduplicated job
+        '201':
+          description: Research job created
+  /v1/jobs:
+    get:
+      operationId: listJobs
+      summary: List research queue jobs
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [queued, claimed, completed, failed]
+        - in: query
+          name: kind
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+      responses:
+        '200':
+          description: Job list
+  /v1/jobs/{job_id}:
+    get:
+      operationId: getJob
+      summary: Get one job and its proposals
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job and proposals
+        '404':
+          description: Job not found
+  /v1/proposals:
+    get:
+      operationId: listProposals
+      summary: List proposals awaiting or after review
+      parameters:
+        - in: query
+          name: review_status
+          schema:
+            type: string
+            enum: [pending, accepted, rejected]
+            default: pending
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+      responses:
+        '200':
+          description: Proposal list with original jobs
+  /v1/proposals/{proposal_id}/review:
+    post:
+      operationId: reviewProposal
+      summary: Accept or reject a research proposal
+      parameters:
+        - in: path
+          name: proposal_id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [accepted, rejected]
+                reviewer:
+                  type: string
+                notes:
+                  type: string
+                requeue:
+                  type: boolean
+      responses:
+        '200':
+          description: Proposal review recorded
+        '409':
+          description: Proposal is no longer pending
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
