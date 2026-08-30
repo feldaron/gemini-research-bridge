@@ -1,0 +1,54 @@
+name: Temporary reproduce UI setup failure
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: 8d80c1b7472260af6cb83bfae12c7d5a
+      BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Normalize Cloudflare token
+        shell: bash
+        run: |
+          set -euo pipefail
+          token=$(printf '%s' "$CLOUDFLARE_API_TOKEN" | tr -d '\r\n')
+          token=${token#Bearer }
+          token=${token#\"}; token=${token%\"}
+          token=${token#\'}; token=${token%\'}
+          echo "CLOUDFLARE_API_TOKEN=${token}" >> "$GITHUB_ENV"
+      - name: Ensure clean synthetic setup state
+        run: npx wrangler d1 execute gemini-research-bridge --remote --command "DELETE FROM app_settings WHERE key='ui_auth';"
+      - name: Reproduce setup POST
+        shell: bash
+        run: |
+          set -u
+          curl -sS -D setup-post.headers -o setup-post.body \
+            -X POST "$BRIDGE_URL/ui/setup" \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode 'password=synthetic-test-password-12345' \
+            --data-urlencode 'confirm=synthetic-test-password-12345'
+          status=$(awk 'NR==1 {print $2}' setup-post.headers)
+          echo "setup_post_status=$status"
+          echo '--- headers ---'
+          cat setup-post.headers
+          echo '--- body (first 2000 bytes) ---'
+          head -c 2000 setup-post.body || true
+          echo
+      - name: Inspect whether auth row was written
+        run: npx wrangler d1 execute gemini-research-bridge --remote --command "SELECT key, length(value) AS value_length FROM app_settings WHERE key='ui_auth';"
+      - name: Clean synthetic setup state
+        if: always()
+        run: npx wrangler d1 execute gemini-research-bridge --remote --command "DELETE FROM app_settings WHERE key='ui_auth';"
