@@ -1,6 +1,6 @@
 import app from "./app";
 import { runAntigravityCycle } from "./antigravity";
-import { decorateDashboard, handleUiShell, loadStoredGeminiKey } from "./ui-shell";
+import { handleUiShell, loadStoredGeminiKey } from "./ui-shell";
 
 interface Env {
   DB: D1Database;
@@ -17,6 +17,20 @@ async function runtimeEnv(env: Env): Promise<Env> {
   return { ...env, GEMINI_API_KEY: storedKey };
 }
 
+async function addAgentLink(request: Request, response: Response): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method !== "GET" || url.pathname !== "/" || !response.headers.get("content-type")?.includes("text/html")) return response;
+  const html = await response.text();
+  if (!html.includes('action="/ui/logout"') || html.includes('href="/ui/agent"')) {
+    return new Response(html, { status: response.status, headers: response.headers });
+  }
+  const decorated = html.replace(
+    '<form method="post" action="/ui/logout">',
+    '<a class="button secondary" href="/ui/agent" style="margin-right:8px">Antigravity agent</a><form method="post" action="/ui/logout">',
+  );
+  return new Response(decorated, { status: response.status, headers: response.headers });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const activeEnv = await runtimeEnv(env);
@@ -24,7 +38,7 @@ export default {
     if (shell) return shell;
 
     let response = await app.fetch(request, activeEnv);
-    response = await decorateDashboard(request, response);
+    response = await addAgentLink(request, response);
 
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health" && response.headers.get("content-type")?.includes("application/json")) {
