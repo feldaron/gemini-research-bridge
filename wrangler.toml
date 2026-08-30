@@ -1,0 +1,10 @@
+name = "gemini-research-bridge"
+main = "src/index.ts"
+compatibility_date = "2026-08-30"
+workers_dev = true
+
+# Add the D1 binding once the standalone database exists:
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "gemini-research-bridge"
+# database_id = "<D1_DATABASE_ID>"
