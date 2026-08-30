@@ -11,8 +11,8 @@
     "d1:migrate:remote": "wrangler d1 migrations apply gemini-research-bridge --remote"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260828.0",
-    "typescript": "^5.9.2",
-    "wrangler": "^4.33.1"
+    "@cloudflare/workers-types": "latest",
+    "typescript": "latest",
+    "wrangler": "latest"
   }
 }
