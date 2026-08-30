@@ -31,22 +31,28 @@ jobs:
           echo "CLOUDFLARE_API_TOKEN=${token}" >> "$GITHUB_ENV"
       - name: Ensure clean synthetic setup state
         run: npx wrangler d1 execute gemini-research-bridge --remote --command "DELETE FROM app_settings WHERE key='ui_auth';"
-      - name: Reproduce setup POST
+      - name: Capture live Worker exception
         shell: bash
         run: |
           set -u
+          : > tail.log
+          timeout 20s npx wrangler tail gemini-research-bridge --format=json > tail.log 2>&1 &
+          tail_pid=$!
+          sleep 4
           curl -sS -D setup-post.headers -o setup-post.body \
             -X POST "$BRIDGE_URL/ui/setup" \
             -H 'Content-Type: application/x-www-form-urlencoded' \
             --data-urlencode 'password=synthetic-test-password-12345' \
-            --data-urlencode 'confirm=synthetic-test-password-12345'
-          status=$(awk 'NR==1 {print $2}' setup-post.headers)
-          echo "setup_post_status=$status"
-          echo '--- headers ---'
-          cat setup-post.headers
-          echo '--- body (first 2000 bytes) ---'
-          head -c 2000 setup-post.body || true
+            --data-urlencode 'confirm=synthetic-test-password-12345' || true
+          sleep 4
+          kill "$tail_pid" 2>/dev/null || true
+          wait "$tail_pid" 2>/dev/null || true
+          echo '--- response ---'
+          cat setup-post.headers || true
+          head -c 1000 setup-post.body || true
           echo
+          echo '--- worker tail ---'
+          cat tail.log || true
       - name: Inspect whether auth row was written
         run: npx wrangler d1 execute gemini-research-bridge --remote --command "SELECT key, length(value) AS value_length FROM app_settings WHERE key='ui_auth';"
       - name: Clean synthetic setup state
