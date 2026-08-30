@@ -1,0 +1,65 @@
+name: Temporary dashboard and MCP smoke test
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: 8d80c1b7472260af6cb83bfae12c7d5a
+      CLIENT_TOKEN: ${{ secrets.CLIENT_TOKEN }}
+      BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Normalize Cloudflare token
+        shell: bash
+        run: |
+          set -euo pipefail
+          token=$(printf '%s' "$CLOUDFLARE_API_TOKEN" | tr -d '\r\n')
+          token=${token#Bearer }
+          token=${token#\"}; token=${token%\"}
+          token=${token#\'}; token=${token%\'}
+          echo "CLOUDFLARE_API_TOKEN=${token}" >> "$GITHUB_ENV"
+      - name: Apply D1 migrations
+        run: npx wrangler d1 migrations apply gemini-research-bridge --remote
+      - name: Wait for dashboard deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            body=$(curl -fsS "$BRIDGE_URL/" || true)
+            if printf '%s' "$body" | grep -q "First-time dashboard setup"; then
+              echo "dashboard_setup_ready=true"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Dashboard setup screen did not become live"
+          exit 1
+      - name: Verify MCP initialize and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $CLIENT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "$BRIDGE_URL/mcp" \
+            --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"github-smoke","version":"1"}}}' > init.json
+          cat init.json
+          jq -e '.result.serverInfo.name == "gemini-research-bridge"' init.json >/dev/null
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $CLIENT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "$BRIDGE_URL/mcp" \
+            --data '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' > tools.json
+          cat tools.json
+          test "$(jq '.result.tools | length' tools.json)" -ge 5
+          jq -e '.result.tools | any(.name == "research_submit")' tools.json >/dev/null
+          jq -e '.result.tools | any(.name == "research_proposals")' tools.json >/dev/null
