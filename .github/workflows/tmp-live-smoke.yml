@@ -1,0 +1,153 @@
+name: Temporary live bridge smoke test
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: 8d80c1b7472260af6cb83bfae12c7d5a
+      CLIENT_TOKEN: ${{ secrets.CLIENT_TOKEN }}
+      WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+      BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${CLOUDFLARE_API_TOKEN:-}" || { echo "CLOUDFLARE_API_TOKEN missing"; exit 1; }
+          test -n "${CLIENT_TOKEN:-}" || { echo "CLIENT_TOKEN missing"; exit 1; }
+          test -n "${WORKER_TOKEN:-}" || { echo "WORKER_TOKEN missing"; exit 1; }
+          if [ "$CLIENT_TOKEN" = "$WORKER_TOKEN" ]; then
+            echo "CLIENT_TOKEN and WORKER_TOKEN must differ"
+            exit 1
+          fi
+          token=$(printf '%s' "$CLOUDFLARE_API_TOKEN" | tr -d '\r\n')
+          token=${token#Bearer }
+          token=${token#\"}; token=${token%\"}
+          token=${token#\'}; token=${token%\'}
+          echo "CLOUDFLARE_API_TOKEN=${token}" >> "$GITHUB_ENV"
+
+      - name: Install Worker role secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$CLIENT_TOKEN" | npx wrangler secret put CLIENT_TOKEN
+          printf '%s' "$WORKER_TOKEN" | npx wrangler secret put WORKER_TOKEN
+
+      - name: Wait for ready health
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            curl --fail-with-body -sS "$BRIDGE_URL/health" -o health.json
+            cat health.json
+            if [ "$(jq -r '.ready' health.json)" = "true" ]; then
+              jq -e '.bindings.db == true and .bindings.client_auth == true and .bindings.worker_auth == true' health.json >/dev/null
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Bridge did not become ready"
+          exit 1
+
+      - name: Submit controller research job
+        id: submit
+        shell: bash
+        run: |
+          set -euo pipefail
+          request_key="live-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          jq -n \
+            --arg task "Smoke-test the research bridge protocol. Do not perform external research; return unresolved." \
+            --arg key "$request_key" \
+            '{task:$task, context:{purpose:"live bridge smoke test"}, request_key:$key, max_attempts:1}' > request.json
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $CLIENT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "$BRIDGE_URL/v1/research" \
+            --data @request.json > submitted.json
+          cat submitted.json
+          job_id=$(jq -r '.job.id' submitted.json)
+          test -n "$job_id" && test "$job_id" != "null"
+          echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
+          echo "request_key=$request_key" >> "$GITHUB_OUTPUT"
+
+      - name: Claim as Gemini worker
+        id: claim
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n '{worker_id:"github-live-smoke", lease_seconds:300}' > claim.json
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $WORKER_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "$BRIDGE_URL/v1/worker/claim" \
+            --data @claim.json > claimed.json
+          cat claimed.json
+          expected='${{ steps.submit.outputs.job_id }}'
+          actual=$(jq -r '.job.id' claimed.json)
+          test "$actual" = "$expected"
+          claim_token=$(jq -r '.job.claim_token' claimed.json)
+          test -n "$claim_token" && test "$claim_token" != "null"
+          jq -e '.job.prompt | contains("Return only the requested JSON result object")' claimed.json >/dev/null
+          jq -e '.job.response_format.output_mode == "json_only"' claimed.json >/dev/null
+          echo "claim_token=$claim_token" >> "$GITHUB_OUTPUT"
+
+      - name: Submit structured unresolved proposal
+        id: propose
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg token '${{ steps.claim.outputs.claim_token }}' \
+            '{worker_id:"github-live-smoke", claim_token:$token, result:{resolution:"unresolved", proposed_value:null, evidence:[], reasoning:"Intentional protocol smoke test; no external research was performed.", confidence:"low", conflicts:[], research_notes:"Synthetic smoke-test proposal."}}' > proposal.json
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $WORKER_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "$BRIDGE_URL/v1/worker/jobs/${{ steps.submit.outputs.job_id }}/propose" \
+            --data @proposal.json > proposed.json
+          cat proposed.json
+          proposal_id=$(jq -r '.proposal.id' proposed.json)
+          test -n "$proposal_id" && test "$proposal_id" != "null"
+          test "$(jq -r '.proposal.review_status' proposed.json)" = "pending"
+          echo "proposal_id=$proposal_id" >> "$GITHUB_OUTPUT"
+
+      - name: Verify controller pending-review queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $CLIENT_TOKEN" \
+            "$BRIDGE_URL/v1/proposals?review_status=pending&limit=100" > pending.json
+          cat pending.json
+          jq -e --arg id '${{ steps.propose.outputs.proposal_id }}' '.proposals | any(.proposal.id == $id)' pending.json >/dev/null
+
+      - name: Verify review action
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n '{decision:"rejected", reviewer:"github-live-smoke", notes:"Synthetic smoke-test proposal; expected rejection."}' > review.json
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $CLIENT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "$BRIDGE_URL/v1/proposals/${{ steps.propose.outputs.proposal_id }}/review" \
+            --data @review.json > reviewed.json
+          cat reviewed.json
+          test "$(jq -r '.proposal.review_status' reviewed.json)" = "rejected"
+
+      - name: Remove synthetic smoke-test row
+        if: always() && steps.submit.outputs.job_id != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler d1 execute gemini-research-bridge --remote \
+            --command "DELETE FROM jobs WHERE id = '${{ steps.submit.outputs.job_id }}';"
