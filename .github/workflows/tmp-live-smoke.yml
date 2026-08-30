@@ -101,7 +101,7 @@ jobs:
           test "$actual" = "$expected"
           claim_token=$(jq -r '.job.claim_token' claimed.json)
           test -n "$claim_token" && test "$claim_token" != "null"
-          jq -e '.job.prompt | contains("Return only the requested JSON result object")' claimed.json >/dev/null
+          jq -e '.job.prompt | contains("return only the requested JSON result object")' claimed.json >/dev/null
           jq -e '.job.response_format.output_mode == "json_only"' claimed.json >/dev/null
           echo "claim_token=$claim_token" >> "$GITHUB_OUTPUT"
 
