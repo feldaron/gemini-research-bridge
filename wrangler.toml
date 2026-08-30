@@ -1,10 +1,12 @@
 name = "gemini-research-bridge"
-main = "src/app.ts"
+main = "src/main.ts"
 compatibility_date = "2026-08-30"
 workers_dev = true
 
 [vars]
-GEMINI_MODEL = "gemini-3.1-pro-preview"
+GEMINI_MODEL = "Antigravity managed agent"
+ANTIGRAVITY_AGENT = "antigravity-preview-05-2026"
+ANTIGRAVITY_CONCURRENCY = "1"
 
 [triggers]
 crons = ["* * * * *"]
