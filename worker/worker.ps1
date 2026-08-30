@@ -23,7 +23,7 @@ function Get-PropertyValue {
 function Convert-ModelResponseToJson {
     param([string]$Text)
     $candidate = $Text.Trim()
-    if ($candidate.StartsWith("```")) {
+    if ($candidate.StartsWith('```')) {
         $candidate = $candidate -replace '^```(?:json)?\s*', ''
         $candidate = $candidate -replace '\s*```$', ''
         $candidate = $candidate.Trim()
