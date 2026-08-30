@@ -1,23 +1,24 @@
-name: Temporary D1 bootstrap
+name: Temporary bridge audit
 
 on:
   push:
     branches: [main]
 
 jobs:
-  bootstrap:
+  audit:
     runs-on: ubuntu-latest
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: 8d80c1b7472260af6cb83bfae12c7d5a
+      CLIENT_TOKEN: ${{ secrets.CLIENT_TOKEN }}
+      WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: npm install
-      - name: Locate or create D1 database
-        id: d1
+      - name: Normalize Cloudflare token
         shell: bash
         run: |
           set -euo pipefail
@@ -25,33 +26,33 @@ jobs:
           token=${token#Bearer }
           token=${token#\"}; token=${token%\"}
           token=${token#\'}; token=${token%\'}
-          export CLOUDFLARE_API_TOKEN="$token"
-
-          list=$(curl --fail-with-body -sS \
-            -H "Authorization: Bearer ${token}" \
-            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database?name=gemini-research-bridge&per_page=100")
-          db_id=$(printf '%s' "$list" | jq -r '.result[]? | select(.name == "gemini-research-bridge") | .uuid' | head -n1)
-
-          if [ -z "$db_id" ]; then
-            created=$(curl --fail-with-body -sS -X POST \
-              -H "Authorization: Bearer ${token}" \
-              -H "Content-Type: application/json" \
-              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
-              --data '{"name":"gemini-research-bridge","jurisdiction":"eu"}')
-            db_id=$(printf '%s' "$created" | jq -r '.result.uuid')
-            echo "created=true"
-          else
-            echo "created=false"
-          fi
-
-          echo "database_name=gemini-research-bridge"
-          echo "database_id=${db_id}"
-          echo "database_id=${db_id}" >> "$GITHUB_OUTPUT"
           echo "CLOUDFLARE_API_TOKEN=${token}" >> "$GITHUB_ENV"
-
-      - name: Apply D1 migrations
-        run: npx wrangler d1 migrations apply gemini-research-bridge --remote
-
-      - name: Verify D1 schema
+      - name: Install bridge secrets when available
+        shell: bash
         run: |
-          npx wrangler d1 execute gemini-research-bridge --remote --command "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('jobs','job_events','proposals') ORDER BY name;"
+          set -euo pipefail
+          if [ -n "${CLIENT_TOKEN:-}" ]; then
+            printf '%s' "$CLIENT_TOKEN" | npx wrangler secret put CLIENT_TOKEN
+            echo "client_token_present=true"
+          else
+            echo "client_token_present=false"
+          fi
+          if [ -n "${WORKER_TOKEN:-}" ]; then
+            printf '%s' "$WORKER_TOKEN" | npx wrangler secret put WORKER_TOKEN
+            echo "worker_token_present=true"
+          else
+            echo "worker_token_present=false"
+          fi
+      - name: Inspect Worker account and bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+          subdomain=$(curl --fail-with-body -sS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain")
+          echo "workers_subdomain=$(printf '%s' "$subdomain" | jq -r '.result.subdomain // empty')"
+
+          settings=$(curl --fail-with-body -sS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/gemini-research-bridge/settings")
+          printf '%s' "$settings" | jq '{bindings: [.result.bindings[]? | {name, type, id}]}'
