@@ -11,7 +11,13 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: 8d80c1b7472260af6cb83bfae12c7d5a
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
       - name: Locate or create D1 database
+        id: d1
         shell: bash
         run: |
           set -euo pipefail
@@ -19,6 +25,7 @@ jobs:
           token=${token#Bearer }
           token=${token#\"}; token=${token%\"}
           token=${token#\'}; token=${token%\'}
+          export CLOUDFLARE_API_TOKEN="$token"
 
           list=$(curl --fail-with-body -sS \
             -H "Authorization: Bearer ${token}" \
@@ -39,3 +46,12 @@ jobs:
 
           echo "database_name=gemini-research-bridge"
           echo "database_id=${db_id}"
+          echo "database_id=${db_id}" >> "$GITHUB_OUTPUT"
+          echo "CLOUDFLARE_API_TOKEN=${token}" >> "$GITHUB_ENV"
+
+      - name: Apply D1 migrations
+        run: npx wrangler d1 migrations apply gemini-research-bridge --remote
+
+      - name: Verify D1 schema
+        run: |
+          npx wrangler d1 execute gemini-research-bridge --remote --command "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('jobs','job_events','proposals') ORDER BY name;"
