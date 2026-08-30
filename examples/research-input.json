@@ -1,0 +1,13 @@
+{
+  "format": "gemini-research-bridge.research-input.v1",
+  "jobs": [
+    {
+      "task": "Research the requested fact and return defensible evidence.",
+      "context": {
+        "subject_id": "example-subject",
+        "known_evidence": []
+      },
+      "request_key": "example-subject:example-fact"
+    }
+  ]
+}
