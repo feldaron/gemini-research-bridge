@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   submit:
-    if: github.event_name == 'issues'
+    if: github.event_name == 'issues' && github.event.issue.user.login == github.repository_owner
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -36,17 +36,17 @@ jobs:
           python3 - <<'PY' > task.json
           import json, os
           event = json.load(open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8'))
-          body = event['issue'].get('body') or ''
+          issue_body = event['issue'].get('body') or ''
           start = '<!-- gemini-research-bridge:task:v1'
           end = '-->'
-          if start not in body:
-              raise SystemExit(78)
-          payload = body.split(start, 1)[1].split(end, 1)[0].strip()
+          if start not in issue_body:
+              raise SystemExit(0)
+          payload = issue_body.split(start, 1)[1].split(end, 1)[0].strip()
           data = json.loads(payload)
           if not isinstance(data, dict) or not str(data.get('task', '')).strip():
               raise SystemExit('Mailbox task must contain a non-empty task')
           data['request_key'] = f"github-issue:{event['issue']['number']}"
-          json.dump(data, open('task.json', 'w', encoding='utf-8'), ensure_ascii=False)
+          print(json.dumps(data, ensure_ascii=False))
           PY
 
           if [ ! -s task.json ]; then
@@ -86,7 +86,7 @@ jobs:
           fi
 
   review:
-    if: github.event_name == 'issue_comment' && github.event.issue.pull_request == null
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request == null && github.event.comment.user.login == github.repository_owner
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
