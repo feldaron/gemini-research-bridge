@@ -1,5 +1,6 @@
 import app from "./app";
 import { runAntigravityCycle } from "./antigravity";
+import { handleSetupFix } from "./setup-fix";
 import { handleUiShell, loadStoredGeminiKey } from "./ui-shell";
 
 interface Env {
@@ -33,6 +34,9 @@ async function addAgentLink(request: Request, response: Response): Promise<Respo
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const setup = await handleSetupFix(request, env);
+    if (setup) return setup;
+
     const activeEnv = await runtimeEnv(env);
     const shell = await handleUiShell(request, activeEnv);
     if (shell) return shell;
