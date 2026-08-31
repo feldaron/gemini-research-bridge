@@ -24,6 +24,7 @@ jobs:
       CLIENT_TOKEN: ${{ secrets.CLIENT_TOKEN }}
       BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
       ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_BODY: ${{ github.event.issue.body }}
     steps:
       - name: Sync pending proposal for this issue
         shell: bash
@@ -52,6 +53,13 @@ jobs:
             exists=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" --paginate \
               --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1 || true)
             [ -z "$exists" ] || continue
+
+            if printf '%s' "$ISSUE_BODY" | grep -q 'gemini-research-bridge:dossier:v1'; then
+              fact_count=$(printf '%s' "$row" | jq -r '(.proposal.result.proposed_value.facts // []) | length')
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="${marker}\n### Antigravity research dossier ready\n**Proposal:** \`${proposal_id}\`  \n**Facts returned:** **${fact_count}**\n\nThe full dossier is intentionally not copied into one GitHub comment. Use \`/fanout\` to render one independently reviewable GitHub comment per fact." >/dev/null
+              continue
+            fi
 
             printf '%s' "$row" | jq -r --arg marker "$marker" '
               .proposal.result as $r |
