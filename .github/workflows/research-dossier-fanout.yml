@@ -1,0 +1,118 @@
+name: Research dossier fan-out
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: research-dossier-fanout-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  fanout:
+    if: >-
+      github.event.issue.pull_request == null &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, '/fanout')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLIENT_TOKEN: ${{ secrets.CLIENT_TOKEN }}
+      BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - name: Fan out dossier into scalar fact proposals
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${CLIENT_TOKEN:-}" || { echo "CLIENT_TOKEN is not configured"; exit 1; }
+
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $CLIENT_TOKEN" \
+            "$BRIDGE_URL/v1/proposals?review_status=pending&limit=500" > proposals.json
+
+          jq -c --arg key "github-issue:${ISSUE_NUMBER}" \
+            '[.proposals[] | select(.job.request_key == $key)] | last // empty' proposals.json > row.json
+
+          if [ ! -s row.json ] || [ "$(cat row.json)" = "null" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+              -f body="No pending bridge dossier proposal is currently available for this issue." >/dev/null
+            exit 0
+          fi
+
+          proposal_id=$(jq -r '.proposal.id' row.json)
+          fact_count=$(jq -r '(.proposal.result.proposed_value.facts // []) | length' row.json)
+          if [ "$fact_count" -lt 1 ]; then
+            echo "Pending proposal does not contain proposed_value.facts"
+            exit 1
+          fi
+
+          invalid_count=$(jq -r '[.proposal.result.proposed_value.facts[] |
+            select(
+              (.feature_code | type != "string") or
+              (.fact_entry_id | type != "string") or
+              ((.resolution != "proposed") and (.resolution != "unresolved")) or
+              (.evidence | type != "array") or
+              (.reasoning | type != "string") or
+              ((.confidence != "high") and (.confidence != "medium") and (.confidence != "low")) or
+              (.conflicts | type != "array") or
+              ((.resolution == "unresolved") and (.proposed_value != null))
+            )
+          ] | length' row.json)
+          if [ "$invalid_count" -ne 0 ]; then
+            echo "Dossier contains $invalid_count malformed fact result(s)"
+            exit 1
+          fi
+
+          jq -c '.proposal.result.proposed_value.facts[]' row.json > facts.ndjson
+
+          posted=0
+          skipped=0
+          while IFS= read -r fact; do
+            [ -n "$fact" ] || continue
+            fact_entry_id=$(printf '%s' "$fact" | jq -r '.fact_entry_id')
+            feature_code=$(printf '%s' "$fact" | jq -r '.feature_code')
+            marker="<!-- dossier-fact:${fact_entry_id} -->"
+
+            exists=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" --paginate \
+              --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1 || true)
+            if [ -n "$exists" ]; then
+              skipped=$((skipped + 1))
+              continue
+            fi
+
+            printf '%s' "$fact" | jq -r --arg marker "$marker" --arg proposal_id "$proposal_id" '
+              [$marker,
+               "### Fact proposal · `" + .feature_code + "`",
+               "**Parent dossier proposal:** `" + $proposal_id + "`  ",
+               "**Fact entry:** `" + .fact_entry_id + "`  ",
+               "**Resolution:** **" + .resolution + "**  ",
+               "**Confidence:** " + .confidence + "  ",
+               "**Proposed value:** `" + ((.proposed_value // null) | tostring) + "`",
+               "",
+               "#### Reasoning",
+               .reasoning,
+               "",
+               "#### Evidence",
+               (if (.evidence | length) == 0 then "No evidence returned."
+                else (.evidence | map("- [" + (.source_title // "Source") + "](" + (.url // "") + ") — " + (.evidence_text // "") + "\n  - Applies to: " + (.applies_to // "—") + "\n  - Applicability: " + (.applicability // "—")) | join("\n")) end),
+               "",
+               "#### Conflicts",
+               (if (.conflicts | length) == 0 then "None reported." else (.conflicts | map("- " + tostring) | join("\n")) end),
+               "",
+               "#### Controller review",
+               "- `/accept-fact " + .fact_entry_id + "`",
+               "- `/reject-fact " + .fact_entry_id + "`"
+              ] | join("\n")' > fact.md
+
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+              -F body=@fact.md >/dev/null
+            posted=$((posted + 1))
+          done < facts.ndjson
+
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="Dossier fan-out complete for proposal \`${proposal_id}\`: **${posted}** fact proposal comments posted, **${skipped}** already present, **${fact_count}** total dossier facts." >/dev/null
