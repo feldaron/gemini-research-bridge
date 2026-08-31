@@ -13,7 +13,7 @@ jobs:
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
     steps:
-      - name: Confirm secret exists and Google accepts it
+      - name: Confirm normalized secret is accepted by Google
         shell: bash
         run: |
           set -euo pipefail
@@ -21,12 +21,19 @@ jobs:
             echo "GEMINI_API_KEY is missing or empty"
             exit 1
           fi
+          key=$(printf '%s' "$GEMINI_API_KEY" | tr -d '\r\n')
+          key="${key#\"}"; key="${key%\"}"
+          key="${key#\'}"; key="${key%\'}"
+          if [ -z "$key" ]; then
+            echo "GEMINI_API_KEY becomes empty after normalization"
+            exit 1
+          fi
           status=$(curl -sS -o response.json -w '%{http_code}' \
-            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+            -H "x-goog-api-key: ${key}" \
             'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1')
           echo "google_status=${status}"
           if [ "$status" != "200" ]; then
-            jq '{error: .error}' response.json || cat response.json
+            jq '{error: {code: .error.code, status: .error.status, message: .error.message}}' response.json || true
             exit 1
           fi
-          echo "GEMINI_API_KEY is present and accepted by Google"
+          echo "GEMINI_API_KEY is present and accepted by Google after safe normalization"
