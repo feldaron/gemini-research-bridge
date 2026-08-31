@@ -1,0 +1,84 @@
+name: Research mailbox sync now
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: research-mailbox-sync-now-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: >-
+      github.event.issue.pull_request == null &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, '/sync')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLIENT_TOKEN: ${{ secrets.CLIENT_TOKEN }}
+      BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - name: Sync pending proposal for this issue
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${CLIENT_TOKEN:-}" || { echo "CLIENT_TOKEN is not configured"; exit 1; }
+
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer $CLIENT_TOKEN" \
+            "$BRIDGE_URL/v1/proposals?review_status=pending&limit=500" > proposals.json
+
+          jq -c --arg key "github-issue:${ISSUE_NUMBER}" \
+            '.proposals[] | select(.job.request_key == $key)' proposals.json > proposals.ndjson
+
+          if [ ! -s proposals.ndjson ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+              -f body="No pending bridge proposal is currently available for this issue." >/dev/null
+            exit 0
+          fi
+
+          while IFS= read -r row; do
+            [ -n "$row" ] || continue
+            proposal_id=$(printf '%s' "$row" | jq -r '.proposal.id')
+            marker="<!-- bridge-proposal:${proposal_id} -->"
+
+            exists=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" --paginate \
+              --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1 || true)
+            [ -z "$exists" ] || continue
+
+            printf '%s' "$row" | jq -r --arg marker "$marker" '
+              .proposal.result as $r |
+              [$marker,
+               "### Antigravity research proposal",
+               "**Proposal:** `" + .proposal.id + "`  ",
+               "**Resolution:** **" + ($r.resolution // "unknown") + "**  ",
+               "**Confidence:** " + ($r.confidence // "unknown") + "  ",
+               "**Proposed value:** `" + (($r.proposed_value // null) | tostring) + "`",
+               "",
+               "#### Reasoning",
+               ($r.reasoning // "—"),
+               "",
+               "#### Evidence",
+               (if (($r.evidence // []) | length) == 0 then "No evidence returned."
+                else (($r.evidence // []) | map("- [" + (.source_title // "Source") + "](" + (.url // "") + ") — " + (.evidence_text // "") + "\n  - Applies to: " + (.applies_to // "—") + "\n  - Applicability: " + (.applicability // "—")) | join("\n")) end),
+               "",
+               "#### Conflicts",
+               (if (($r.conflicts // []) | length) == 0 then "None reported." else (($r.conflicts // []) | map("- " + tostring) | join("\n")) end),
+               "",
+               "#### Review from ChatGPT",
+               "Comment one of:",
+               "- `/accept " + .proposal.id + "`",
+               "- `/reject " + .proposal.id + "`",
+               "- `/research-again " + .proposal.id + "`"
+              ] | join("\n")' > proposal.md
+
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+              -F body=@proposal.md >/dev/null
+          done < proposals.ndjson
