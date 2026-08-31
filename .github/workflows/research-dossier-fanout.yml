@@ -44,38 +44,153 @@ jobs:
             exit 0
           fi
 
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" --jq '.body' > parent.md
+
+          contract_issue=$(python3 - <<'PY'
+          import json, re
+          body = open('parent.md', encoding='utf-8').read()
+          start = '<!-- gemini-research-bridge:task:v1'
+          if start not in body:
+              raise SystemExit('Parent issue has no bridge task marker')
+          payload = body.split(start, 1)[1].split('-->', 1)[0].strip()
+          task = json.loads(payload)
+          url = str((task.get('context') or {}).get('dossier_contract_url') or '')
+          m = re.search(r'/issues/(\d+)(?:$|[?#])', url)
+          if not m:
+              raise SystemExit('Parent task has no valid dossier_contract_url')
+          print(m.group(1))
+          PY
+          )
+
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${contract_issue}" --jq '.body' > contract.md
+
+          python3 - <<'PY'
+          import json, re
+
+          contract = open('contract.md', encoding='utf-8').read()
+          marker = '### Unresolved fact manifest'
+          if marker not in contract:
+              raise SystemExit('Authoritative contract has no unresolved fact manifest')
+          tail = contract.split(marker, 1)[1]
+          m = re.search(r'```text\s*\n(.*?)\n```', tail, re.S)
+          if not m:
+              raise SystemExit('Could not parse authoritative manifest code block')
+
+          expected = {}
+          for raw in m.group(1).splitlines():
+              line = raw.strip()
+              if not line:
+                  continue
+              parts = line.split('|')
+              if len(parts) != 7:
+                  raise SystemExit(f'Bad manifest row: {line}')
+              code, fact_id, value_type, unit, essential, allowed_raw, protocol = parts
+              if code in expected:
+                  raise SystemExit(f'Duplicate manifest feature code: {code}')
+              expected[code] = {
+                  'fact_entry_id': fact_id,
+                  'type': value_type,
+                  'unit': unit,
+                  'essential': essential,
+                  'allowed': [x for x in allowed_raw.split(',') if x],
+                  'protocol': protocol,
+              }
+
+          row = json.load(open('row.json', encoding='utf-8'))
+          result = ((row.get('proposal') or {}).get('result') or {})
+          facts = ((result.get('proposed_value') or {}).get('facts') or [])
+          if not isinstance(facts, list):
+              raise SystemExit('proposed_value.facts is not an array')
+          if len(facts) != len(expected):
+              raise SystemExit(f'Dossier returned {len(facts)} facts; expected {len(expected)}')
+
+          seen_codes = set()
+          seen_ids = set()
+          errors = []
+          normalized = []
+
+          for index, fact in enumerate(facts):
+              if not isinstance(fact, dict):
+                  errors.append(f'fact[{index}] is not an object')
+                  continue
+              code = fact.get('feature_code')
+              fact_id = fact.get('fact_entry_id')
+              if code not in expected:
+                  errors.append(f'fact[{index}] unknown feature_code {code!r}')
+                  continue
+              spec = expected[code]
+              if fact_id != spec['fact_entry_id']:
+                  errors.append(f'{code}: fact_entry_id mismatch')
+              if code in seen_codes:
+                  errors.append(f'{code}: duplicate feature_code')
+              if fact_id in seen_ids:
+                  errors.append(f'{code}: duplicate fact_entry_id')
+              seen_codes.add(code)
+              seen_ids.add(fact_id)
+
+              resolution = fact.get('resolution')
+              value = fact.get('proposed_value')
+              evidence = fact.get('evidence')
+              reasoning = fact.get('reasoning')
+              confidence = fact.get('confidence')
+              conflicts = fact.get('conflicts')
+
+              if resolution not in ('proposed', 'unresolved'):
+                  errors.append(f'{code}: invalid resolution')
+              if not isinstance(evidence, list):
+                  errors.append(f'{code}: evidence must be array')
+              if not isinstance(reasoning, str) or not reasoning.strip():
+                  errors.append(f'{code}: reasoning required')
+              if confidence not in ('high', 'medium', 'low'):
+                  errors.append(f'{code}: invalid confidence')
+              if not isinstance(conflicts, list):
+                  errors.append(f'{code}: conflicts must be array')
+
+              if resolution == 'unresolved':
+                  if value is not None:
+                      errors.append(f'{code}: unresolved proposed_value must be null')
+              elif resolution == 'proposed':
+                  if not evidence:
+                      errors.append(f'{code}: proposed result requires evidence')
+                  typ = spec['type']
+                  if typ == 'boolean' and type(value) is not bool:
+                      errors.append(f'{code}: expected boolean value')
+                  elif typ == 'integer' and (type(value) is not int):
+                      errors.append(f'{code}: expected integer value')
+                  elif typ == 'numeric' and (type(value) not in (int, float)):
+                      errors.append(f'{code}: expected numeric value')
+                  elif typ == 'text' and not isinstance(value, str):
+                      errors.append(f'{code}: expected text value')
+                  elif typ == 'enum':
+                      allowed = spec['allowed']
+                      if str(value) not in allowed:
+                          errors.append(f'{code}: value {value!r} not in allowed set {allowed}')
+
+              normalized.append(fact)
+
+          missing = sorted(set(expected) - seen_codes)
+          if missing:
+              errors.append('missing features: ' + ', '.join(missing))
+          if len(seen_ids) != len(expected):
+              errors.append(f'unique fact-entry IDs {len(seen_ids)} != expected {len(expected)}')
+
+          if errors:
+              raise SystemExit('Dossier validation failed:\n- ' + '\n- '.join(errors))
+
+          with open('facts.ndjson', 'w', encoding='utf-8') as out:
+              for fact in normalized:
+                  out.write(json.dumps(fact, ensure_ascii=False, separators=(',', ':')) + '\n')
+          print(f'Validated {len(normalized)} dossier facts against authoritative issue manifest.')
+          PY
+
           proposal_id=$(jq -r '.proposal.id' row.json)
-          fact_count=$(jq -r '(.proposal.result.proposed_value.facts // []) | length' row.json)
-          if [ "$fact_count" -lt 1 ]; then
-            echo "Pending proposal does not contain proposed_value.facts"
-            exit 1
-          fi
-
-          invalid_count=$(jq -r '[.proposal.result.proposed_value.facts[] |
-            select(
-              (.feature_code | type != "string") or
-              (.fact_entry_id | type != "string") or
-              ((.resolution != "proposed") and (.resolution != "unresolved")) or
-              (.evidence | type != "array") or
-              (.reasoning | type != "string") or
-              ((.confidence != "high") and (.confidence != "medium") and (.confidence != "low")) or
-              (.conflicts | type != "array") or
-              ((.resolution == "unresolved") and (.proposed_value != null))
-            )
-          ] | length' row.json)
-          if [ "$invalid_count" -ne 0 ]; then
-            echo "Dossier contains $invalid_count malformed fact result(s)"
-            exit 1
-          fi
-
-          jq -c '.proposal.result.proposed_value.facts[]' row.json > facts.ndjson
+          fact_count=$(wc -l < facts.ndjson | tr -d ' ')
 
           posted=0
           skipped=0
           while IFS= read -r fact; do
             [ -n "$fact" ] || continue
             fact_entry_id=$(printf '%s' "$fact" | jq -r '.fact_entry_id')
-            feature_code=$(printf '%s' "$fact" | jq -r '.feature_code')
             marker="<!-- dossier-fact:${fact_entry_id} -->"
 
             exists=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" --paginate \
@@ -115,4 +230,4 @@ jobs:
           done < facts.ndjson
 
           gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
-            -f body="Dossier fan-out complete for proposal \`${proposal_id}\`: **${posted}** fact proposal comments posted, **${skipped}** already present, **${fact_count}** total dossier facts." >/dev/null
+            -f body="Dossier fan-out complete for proposal \`${proposal_id}\`: **${posted}** fact proposal comments posted, **${skipped}** already present, **${fact_count}** validated dossier facts." >/dev/null
