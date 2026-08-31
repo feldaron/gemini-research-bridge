@@ -1,0 +1,71 @@
+name: Research dossier fact review
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: research-dossier-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    if: >-
+      github.event.issue.pull_request == null &&
+      github.event.comment.user.login == github.repository_owner &&
+      (startsWith(github.event.comment.body, '/accept-fact ') || startsWith(github.event.comment.body, '/reject-fact '))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      COMMENT_BODY: ${{ github.event.comment.body }}
+    steps:
+      - name: Apply scalar fact review
+        shell: bash
+        run: |
+          set -euo pipefail
+          command=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | head -n1)
+          action=$(printf '%s' "$command" | awk '{print $1}')
+          fact_entry_id=$(printf '%s' "$command" | awk '{print $2}')
+
+          case "$action" in
+            /accept-fact) decision=accepted ;;
+            /reject-fact) decision=rejected ;;
+            *) exit 0 ;;
+          esac
+
+          if ! printf '%s' "$fact_entry_id" | grep -Eq '^[0-9a-fA-F-]{20,}$'; then
+            echo "Invalid fact entry id"
+            exit 1
+          fi
+
+          marker="<!-- dossier-fact:${fact_entry_id} -->"
+          target_id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" --paginate \
+            --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1 || true)
+          if [ -z "$target_id" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+              -f body="No dossier fact proposal comment found for fact entry \`${fact_entry_id}\`." >/dev/null
+            exit 1
+          fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${target_id}" --jq '.body' > current.md
+          python3 - "$decision" <<'PY'
+          import sys
+          decision = sys.argv[1]
+          body = open('current.md', encoding='utf-8').read()
+          marker = '\n<!-- dossier-review:'
+          if marker in body:
+              body = body.split(marker, 1)[0].rstrip()
+          body += f"\n\n<!-- dossier-review:{decision} -->\n**Controller decision:** **{decision}**\n"
+          open('updated.md', 'w', encoding='utf-8').write(body)
+          PY
+
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${target_id}" \
+            -F body=@updated.md >/dev/null
+
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="Fact entry \`${fact_entry_id}\` marked **${decision}** in the dossier review ledger." >/dev/null
