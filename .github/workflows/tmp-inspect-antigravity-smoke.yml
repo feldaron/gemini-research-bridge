@@ -1,0 +1,27 @@
+name: Temporary inspect Antigravity smoke job
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tmp-inspect-antigravity-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    env:
+      CLIENT_TOKEN: ${{ secrets.CLIENT_TOKEN }}
+      BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
+      JOB_ID: fadce25b-e33c-4ccc-8d40-2faa636a3543
+    steps:
+      - name: Inspect bridge job safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${CLIENT_TOKEN:-}" || { echo 'CLIENT_TOKEN missing'; exit 1; }
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer ${CLIENT_TOKEN}" \
+            "${BRIDGE_URL}/v1/jobs/${JOB_ID}" > job.json
+          jq '{job:{id:.job.id,status:.job.status,attempts:.job.attempts,max_attempts:.job.max_attempts,claimed_by:.job.claimed_by,error:(.job.error // .job.last_error // null)},proposals:[(.proposals // [])[] | {id:.id,resolution:(.result.resolution // null),confidence:(.result.confidence // null),review_status:.review_status}]}' job.json
