@@ -94,6 +94,7 @@ jobs:
       BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       COMMENT_BODY: ${{ github.event.comment.body }}
+      ISSUE_BODY: ${{ github.event.issue.body }}
     steps:
       - name: Apply review command
         shell: bash
@@ -133,7 +134,8 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
             -f body="Review applied to proposal \`${proposal_id}\`: **${resulting}**. Job status: **${job_status}**." >/dev/null
 
-          if [ "$requeue" = "false" ]; then
+          # Dossier issues remain open while their scalar fact comments are adjudicated.
+          if [ "$requeue" = "false" ] && ! printf '%s' "$ISSUE_BODY" | grep -q 'gemini-research-bridge:dossier:v1'; then
             gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" \
               -f state=closed -f state_reason=completed >/dev/null
           fi
