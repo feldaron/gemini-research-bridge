@@ -16,7 +16,7 @@ jobs:
       BRIDGE_URL: https://gemini-research-bridge.laptopvalue.co.uk
       JOB_ID: fadce25b-e33c-4ccc-8d40-2faa636a3543
     steps:
-      - name: Inspect bridge job safely
+      - name: Inspect bridge proposal safely
         shell: bash
         run: |
           set -euo pipefail
@@ -24,4 +24,4 @@ jobs:
           curl --fail-with-body -sS \
             -H "Authorization: Bearer ${CLIENT_TOKEN}" \
             "${BRIDGE_URL}/v1/jobs/${JOB_ID}" > job.json
-          jq '{job:{id:.job.id,status:.job.status,attempts:.job.attempts,max_attempts:.job.max_attempts,claimed_by:.job.claimed_by,error:(.job.error // .job.last_error // null)},proposals:[(.proposals // [])[] | {id:.id,resolution:(.result.resolution // null),confidence:(.result.confidence // null),review_status:.review_status}]}' job.json
+          jq '{job:{id:.job.id,status:.job.status,attempts:.job.attempts,error:(.job.error // .job.last_error // null)},proposals:[(.proposals // [])[] | {id:.id,review_status:.review_status,result:{resolution:.result.resolution,proposed_value:.result.proposed_value,confidence:.result.confidence,reasoning:.result.reasoning,evidence:.result.evidence,conflicts:.result.conflicts}}]}' job.json
